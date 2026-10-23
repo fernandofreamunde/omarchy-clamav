@@ -117,9 +117,11 @@ def write_status(status: dict) -> None:
     status = dict(status)
     status["updatedAt"] = now_iso()
     status["version"] = STATUS_VERSION
-    tmp = status_path().with_suffix(".tmp")
+    path = status_path()
+    # Unique temp name avoids races when the scan worker and status polls write together.
+    tmp = path.with_name(f".status.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(status_path())
+    os.replace(tmp, path)
 
 
 def unit_active(unit: str) -> bool:
