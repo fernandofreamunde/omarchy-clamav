@@ -336,15 +336,18 @@ def python_bin() -> str:
     return "python3"
 
 
-def spawn_detached(worker_args: list[str]) -> None:
+def spawn_detached(worker_args: list[str]) -> int:
     """Start a background worker that does not inherit our stdout/stderr.
 
     The bar drives ctl.py through Quickshell's Process, which waits until every
     writer on the stdout pipe exits. A plain os.fork() left the child attached
     to that pipe, so scan/update appeared to do nothing: the launcher never
     finished and later button clicks were ignored while ctlProcess.running.
+
+    Writes worker.pid immediately from the launcher so a concurrent status poll
+    cannot treat the brief pre-exec gap as "worker exited unexpectedly".
     """
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [python_bin(), str(Path(__file__).resolve()), *worker_args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -352,6 +355,8 @@ def spawn_detached(worker_args: list[str]) -> None:
         start_new_session=True,
         close_fds=True,
     )
+    pid_path().write_text(str(proc.pid) + "\n", encoding="utf-8")
+    return proc.pid
 
 
 def expand_target(raw: str) -> Path:
@@ -874,21 +879,36 @@ def worker_install() -> int:
 
 def cmd_status(notify: bool) -> int:
     status = refresh_database_fields(read_status(), notify=notify)
+    # Grace period: launcher writes pid then execs; avoid false "exited" flaps.
+    def started_recently(iso_text: str, seconds: float = 2.0) -> bool:
+        if not iso_text:
+            return False
+        try:
+            started = datetime.fromisoformat(iso_text)
+            if started.tzinfo is None:
+                started = started.astimezone()
+            return (datetime.now().astimezone() - started).total_seconds() < seconds
+        except ValueError:
+            return False
+
     if status["scan"].get("running") and not worker_alive():
-        status["scan"]["running"] = False
-        if status["phase"] == "scanning":
-            status["phase"] = "error"
-            status["lastError"] = "Scan worker exited unexpectedly"
+        if not started_recently(status["scan"].get("startedAt") or ""):
+            status["scan"]["running"] = False
+            if status["phase"] == "scanning":
+                status["phase"] = "error"
+                status["lastError"] = "Scan worker exited unexpectedly"
     if status["database"].get("updating") and not worker_alive():
-        status["database"]["updating"] = False
-        if status["phase"] == "updating":
-            status["phase"] = "error"
-            status["lastError"] = "Update worker exited unexpectedly"
+        if not started_recently(status["database"].get("lastUpdateAt") or status.get("updatedAt") or ""):
+            status["database"]["updating"] = False
+            if status["phase"] == "updating":
+                status["phase"] = "error"
+                status["lastError"] = "Update worker exited unexpectedly"
     if status["install"].get("installing") and not worker_alive():
-        status["install"]["installing"] = False
-        if status["phase"] == "installing":
-            status["phase"] = "error"
-            status["lastError"] = "Install worker exited unexpectedly"
+        if not started_recently(status["install"].get("lastInstallAt") or status.get("updatedAt") or ""):
+            status["install"]["installing"] = False
+            if status["phase"] == "installing":
+                status["phase"] = "error"
+                status["lastError"] = "Install worker exited unexpectedly"
     # Keep the setup phase visible while ClamAV still needs attention.
     if (
         status["phase"] in ("idle", "error")
