@@ -9,12 +9,14 @@ widget can show live progress.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,8 +36,25 @@ def status_path() -> Path:
     return state_dir() / "status.json"
 
 
+def lock_path() -> Path:
+    return state_dir() / "status.lock"
+
+
 def pid_path() -> Path:
     return state_dir() / "worker.pid"
+
+
+@contextmanager
+def status_lock():
+    """Serialize status.json read-modify-write so polls cannot clobber a scan."""
+    path = lock_path()
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def log_path() -> Path:
@@ -133,15 +152,20 @@ def read_status() -> dict:
     return base
 
 
-def write_status(status: dict) -> None:
+def _write_status_unlocked(status: dict) -> None:
     status = dict(status)
     status["updatedAt"] = now_iso()
     status["version"] = STATUS_VERSION
     path = status_path()
-    # Unique temp name avoids races when the scan worker and status polls write together.
+    # Unique temp name avoids replace races across processes.
     tmp = path.with_name(f".status.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def write_status(status: dict) -> None:
+    with status_lock():
+        _write_status_unlocked(status)
 
 
 def unit_active(unit: str) -> bool:
@@ -416,39 +440,38 @@ def parse_scan_line(line: str) -> tuple[str | None, str | None]:
 
 
 def run_scan(target_raw: str, label: str) -> int:
-    if worker_alive():
+    with status_lock():
+        if worker_alive():
+            status = refresh_database_fields(read_status())
+            status["lastError"] = "A scan or update is already running"
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 1
+
         status = refresh_database_fields(read_status())
-        status["lastError"] = "A scan or update is already running"
-        write_status(status)
-        print(json.dumps(status))
-        return 1
+        if not status["install"].get("ready"):
+            status["lastError"] = "ClamAV is not installed or configured yet"
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 1
 
-    status = refresh_database_fields(read_status())
-    if not status["install"].get("ready"):
-        status["lastError"] = "ClamAV is not installed or configured yet"
-        write_status(status)
-        print(json.dumps(status))
-        return 1
-
-    target = expand_target(target_raw)
-    scan = empty_scan()
-    scan.update(
-        {
-            "running": True,
-            "target": str(target),
-            "label": label or shorten(str(target)),
-            "filesTotal": 0,
-            "startedAt": now_iso(),
-        }
-    )
-    status["phase"] = "scanning"
-    status["scan"] = scan
-    status["lastError"] = ""
-    write_status(status)
-
-    spawn_detached(["_worker-scan", str(target), "--label", label or ""])
-    time.sleep(0.05)
-    print(json.dumps(refresh_database_fields(read_status())))
+        target = expand_target(target_raw)
+        scan = empty_scan()
+        scan.update(
+            {
+                "running": True,
+                "target": str(target),
+                "label": label or shorten(str(target)),
+                "filesTotal": 0,
+                "startedAt": now_iso(),
+            }
+        )
+        status["phase"] = "scanning"
+        status["scan"] = scan
+        status["lastError"] = ""
+        _write_status_unlocked(status)
+        spawn_detached(["_worker-scan", str(target), "--label", label or ""])
+        print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
 
@@ -667,64 +690,64 @@ def _scan_worker(target: Path, label: str) -> None:
 
 
 def stop_worker() -> int:
-    status = refresh_database_fields(read_status())
-    if not pid_path().exists():
+    with status_lock():
+        status = refresh_database_fields(read_status())
+        if not pid_path().exists():
+            status["phase"] = "idle"
+            status["scan"]["running"] = False
+            status["database"]["updating"] = False
+            status["install"]["installing"] = False
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 0
+        pid = None
+        try:
+            pid = int(pid_path().read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        clear_worker_pid()
         status["phase"] = "idle"
         status["scan"]["running"] = False
+        status["scan"]["finishedAt"] = now_iso()
+        status["scan"]["summary"] = "Scan cancelled"
         status["database"]["updating"] = False
         status["install"]["installing"] = False
-        write_status(status)
+        status["lastError"] = ""
+        _write_status_unlocked(status)
         print(json.dumps(status))
-        return 0
-    pid = None
-    try:
-        pid = int(pid_path().read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        pid = None
-    if pid is not None:
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-    clear_worker_pid()
-    status["phase"] = "idle"
-    status["scan"]["running"] = False
-    status["scan"]["finishedAt"] = now_iso()
-    status["scan"]["summary"] = "Scan cancelled"
-    status["database"]["updating"] = False
-    status["install"]["installing"] = False
-    status["lastError"] = ""
-    write_status(status)
-    print(json.dumps(status))
     return 0
 
 
 def run_update() -> int:
-    if worker_alive():
+    with status_lock():
+        if worker_alive():
+            status = refresh_database_fields(read_status())
+            status["lastError"] = "A scan or update is already running"
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 1
+
         status = refresh_database_fields(read_status())
-        status["lastError"] = "A scan or update is already running"
-        write_status(status)
-        print(json.dumps(status))
-        return 1
+        if not status["install"].get("packageInstalled"):
+            status["lastError"] = "ClamAV is not installed — use Install & configure first"
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 1
 
-    status = refresh_database_fields(read_status())
-    if not status["install"].get("packageInstalled"):
-        status["lastError"] = "ClamAV is not installed — use Install & configure first"
-        write_status(status)
-        print(json.dumps(status))
-        return 1
-
-    status["phase"] = "updating"
-    status["database"]["updating"] = True
-    status["lastError"] = ""
-    write_status(status)
-
-    spawn_detached(["_worker-update"])
-    time.sleep(0.05)
-    print(json.dumps(refresh_database_fields(read_status())))
+        status["phase"] = "updating"
+        status["database"]["updating"] = True
+        status["lastError"] = ""
+        _write_status_unlocked(status)
+        spawn_detached(["_worker-update"])
+        print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
 
@@ -785,30 +808,29 @@ def worker_update() -> int:
 
 
 def run_install() -> int:
-    if worker_alive():
+    with status_lock():
+        if worker_alive():
+            status = refresh_database_fields(read_status())
+            status["lastError"] = "A scan or update is already running"
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 1
+
         status = refresh_database_fields(read_status())
-        status["lastError"] = "A scan or update is already running"
-        write_status(status)
-        print(json.dumps(status))
-        return 1
+        if status["install"].get("ready"):
+            status["lastError"] = ""
+            status["install"]["lastInstallMessage"] = "ClamAV is already installed and configured"
+            status["install"]["lastInstallOk"] = True
+            _write_status_unlocked(status)
+            print(json.dumps(status))
+            return 0
 
-    status = refresh_database_fields(read_status())
-    if status["install"].get("ready"):
+        status["phase"] = "installing"
+        status["install"]["installing"] = True
         status["lastError"] = ""
-        status["install"]["lastInstallMessage"] = "ClamAV is already installed and configured"
-        status["install"]["lastInstallOk"] = True
-        write_status(status)
-        print(json.dumps(status))
-        return 0
-
-    status["phase"] = "installing"
-    status["install"]["installing"] = True
-    status["lastError"] = ""
-    write_status(status)
-
-    spawn_detached(["_worker-install"])
-    time.sleep(0.05)
-    print(json.dumps(refresh_database_fields(read_status())))
+        _write_status_unlocked(status)
+        spawn_detached(["_worker-install"])
+        print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
 
@@ -878,57 +900,60 @@ def worker_install() -> int:
 
 
 def cmd_status(notify: bool) -> int:
-    status = refresh_database_fields(read_status(), notify=notify)
-    # Grace period: launcher writes pid then execs; avoid false "exited" flaps.
-    def started_recently(iso_text: str, seconds: float = 2.0) -> bool:
-        if not iso_text:
-            return False
-        try:
-            started = datetime.fromisoformat(iso_text)
-            if started.tzinfo is None:
-                started = started.astimezone()
-            return (datetime.now().astimezone() - started).total_seconds() < seconds
-        except ValueError:
-            return False
+    with status_lock():
+        status = refresh_database_fields(read_status(), notify=notify)
 
-    if status["scan"].get("running") and not worker_alive():
-        if not started_recently(status["scan"].get("startedAt") or ""):
-            status["scan"]["running"] = False
-            if status["phase"] == "scanning":
-                status["phase"] = "error"
-                status["lastError"] = "Scan worker exited unexpectedly"
-    if status["database"].get("updating") and not worker_alive():
-        if not started_recently(status["database"].get("lastUpdateAt") or status.get("updatedAt") or ""):
-            status["database"]["updating"] = False
-            if status["phase"] == "updating":
-                status["phase"] = "error"
-                status["lastError"] = "Update worker exited unexpectedly"
-    if status["install"].get("installing") and not worker_alive():
-        if not started_recently(status["install"].get("lastInstallAt") or status.get("updatedAt") or ""):
-            status["install"]["installing"] = False
-            if status["phase"] == "installing":
-                status["phase"] = "error"
-                status["lastError"] = "Install worker exited unexpectedly"
-    # Keep the setup phase visible while ClamAV still needs attention.
-    if (
-        status["phase"] in ("idle", "error")
-        and not status["install"].get("ready")
-        and not status["install"].get("installing")
-        and not status["scan"].get("running")
-        and not status["database"].get("updating")
-    ):
-        if status["phase"] != "error" or not status.get("lastError"):
-            status["phase"] = "setup"
-    write_status(status)
-    print(json.dumps(status))
+        # Grace period: launcher writes pid then execs; avoid false "exited" flaps.
+        def started_recently(iso_text: str, seconds: float = 2.0) -> bool:
+            if not iso_text:
+                return False
+            try:
+                started = datetime.fromisoformat(iso_text)
+                if started.tzinfo is None:
+                    started = started.astimezone()
+                return (datetime.now().astimezone() - started).total_seconds() < seconds
+            except ValueError:
+                return False
+
+        if status["scan"].get("running") and not worker_alive():
+            if not started_recently(status["scan"].get("startedAt") or ""):
+                status["scan"]["running"] = False
+                if status["phase"] == "scanning":
+                    status["phase"] = "error"
+                    status["lastError"] = "Scan worker exited unexpectedly"
+        if status["database"].get("updating") and not worker_alive():
+            if not started_recently(status["database"].get("lastUpdateAt") or status.get("updatedAt") or ""):
+                status["database"]["updating"] = False
+                if status["phase"] == "updating":
+                    status["phase"] = "error"
+                    status["lastError"] = "Update worker exited unexpectedly"
+        if status["install"].get("installing") and not worker_alive():
+            if not started_recently(status["install"].get("lastInstallAt") or status.get("updatedAt") or ""):
+                status["install"]["installing"] = False
+                if status["phase"] == "installing":
+                    status["phase"] = "error"
+                    status["lastError"] = "Install worker exited unexpectedly"
+        # Keep the setup phase visible while ClamAV still needs attention.
+        if (
+            status["phase"] in ("idle", "error")
+            and not status["install"].get("ready")
+            and not status["install"].get("installing")
+            and not status["scan"].get("running")
+            and not status["database"].get("updating")
+        ):
+            if status["phase"] != "error" or not status.get("lastError"):
+                status["phase"] = "setup"
+        _write_status_unlocked(status)
+        print(json.dumps(status))
     return 0
 
 
 def cmd_ack_reminder() -> int:
-    status = refresh_database_fields(read_status())
-    status["database"]["remindedAt"] = now_iso()
-    write_status(status)
-    print(json.dumps(status))
+    with status_lock():
+        status = refresh_database_fields(read_status())
+        status["database"]["remindedAt"] = now_iso()
+        _write_status_unlocked(status)
+        print(json.dumps(status))
     return 0
 
 
