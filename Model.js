@@ -102,14 +102,14 @@ function phaseLabel(status) {
   var phase = String(status && status.phase || "idle")
   if (phase === "installing" || (status && status.install && status.install.installing))
     return "Installing ClamAV"
-  if (phase === "setup" || needsSetup(status)) {
-    if (status && status.install && status.install.needsConfigure) return "Needs configuration"
-    return "Not installed"
-  }
   if (phase === "scanning") return "Scanning"
   if (phase === "updating") return "Updating definitions"
   if (phase === "infected") return "Threats found"
   if (phase === "error") return "Error"
+  if (phase === "setup" || needsSetup(status)) {
+    if (status && status.install && status.install.needsConfigure) return "Needs configuration"
+    return "Not installed"
+  }
   if (status && status.database && status.database.reminderDue) return "Update definitions"
   if (status && status.database && status.database.stale) return "Definitions getting old"
   return "Ready"
