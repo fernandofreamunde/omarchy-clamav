@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "glink.clamav",
+  "name": "ClamAV",
+  "version": "1.0.0",
+  "author": "glink",
+  "license": "MIT",
+  "description": "Scan files with ClamAV from the bar, watch live progress, and get reminded when virus definitions are stale.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "ClamAV",
+    "description": "Shield in the bar. Shows scan progress while running, reminds you after a week if definitions are stale. Click for Downloads/Home scans and database update.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "defaultTarget": "downloads",
+      "pollIntervalSec": 30
+    },
+    "schema": [
+      {
+        "key": "defaultTarget",
+        "type": "enum",
+        "label": "Default scan target",
+        "options": [
+          "downloads",
+          "home"
+        ],
+        "defaultValue": "downloads",
+        "description": "Right-click on the bar chip starts this scan. Panel buttons can still pick either target."
+      },
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Idle poll interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "How often to refresh database age when idle. While scanning, progress updates much faster from the status file."
+      }
+    ]
+  }
+}
