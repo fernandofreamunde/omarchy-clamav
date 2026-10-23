@@ -18,6 +18,8 @@ Item {
     return dir.replace(/\/$/, "")
   }
   readonly property string ctlPath: pluginDir + "/ctl.py"
+  // Prefer system Python; brew python3 on PATH was fine for status but keep ctl predictable.
+  readonly property string pythonBin: "/usr/bin/python3"
   readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string downloadsDir: {
     var xdg = Quickshell.env("XDG_DOWNLOAD_DIR")
@@ -52,68 +54,79 @@ Item {
     status = parsed
     if (parsed && parsed.lastError)
       lastError = String(parsed.lastError)
-    else if (ctlProcess.running === false)
-      lastError = lastError
   }
 
   function refresh(notifyReminder) {
-    if (ctlProcess.running) return
-    busy = true
-    var command = ["python3", ctlPath, "status"]
+    if (pollProcess.running) return
+    var command = [pythonBin, ctlPath, "status"]
     if (notifyReminder === true) command.push("--notify")
-    ctlProcess.command = command
-    ctlProcess.running = true
+    pollProcess.command = command
+    pollProcess.running = true
+  }
+
+  function runAction(args) {
+    if (actionProcess.running) {
+      lastError = "ClamAV is busy — try again in a moment"
+      return false
+    }
+    busy = true
+    lastError = ""
+    actionProcess.command = [pythonBin, ctlPath].concat(args)
+    actionProcess.running = true
+    return true
   }
 
   function startScan(targetKey) {
-    if (ctlProcess.running) return
     var key = String(targetKey || defaultTarget || "downloads")
     var target = Model.expandScanTarget(key, homeDir, downloadsDir)
     var label = key === "home" ? "Home" : (key === "downloads" ? "Downloads" : key)
-    busy = true
-    lastError = ""
-    ctlProcess.command = ["python3", ctlPath, "scan", target, "--label", label]
-    ctlProcess.running = true
+    runAction(["scan", target, "--label", label])
   }
 
   function stop() {
-    if (ctlProcess.running) return
-    busy = true
-    ctlProcess.command = ["python3", ctlPath, "stop"]
-    ctlProcess.running = true
+    runAction(["stop"])
   }
 
   function updateDatabase() {
-    if (ctlProcess.running) return
-    busy = true
-    lastError = ""
-    ctlProcess.command = ["python3", ctlPath, "update"]
-    ctlProcess.running = true
+    runAction(["update"])
   }
 
   function installOrConfigure() {
-    if (ctlProcess.running) return
-    busy = true
-    lastError = ""
-    ctlProcess.command = ["python3", ctlPath, "install"]
-    ctlProcess.running = true
+    runAction(["install"])
   }
 
   function ackReminder() {
-    if (ctlProcess.running) return
-    ctlProcess.command = ["python3", ctlPath, "ack-reminder"]
-    ctlProcess.running = true
+    runAction(["ack-reminder"])
+  }
+
+  // Polls are separate from actions so a status refresh never blocks Scan/Update.
+  Process {
+    id: pollProcess
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.apply(text)
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") root.lastError = text.trim()
+    }
   }
 
   Process {
-    id: ctlProcess
+    id: actionProcess
     running: false
     onExited: function(exitCode) {
       root.busy = false
       if (exitCode !== 0 && root.lastError === "")
         root.lastError = "ClamAV control failed"
-      // After starting scan/update, immediately re-poll so the bar flips to live state.
-      Qt.callLater(function() { pollTimer.restart() })
+      // Re-read status.json immediately after launching a worker.
+      Qt.callLater(function() {
+        statusFile.reload()
+        pollTimer.restart()
+      })
     }
 
     stdout: StdioCollector {

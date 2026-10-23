@@ -329,6 +329,31 @@ def write_worker_pid() -> None:
     pid_path().write_text(str(os.getpid()) + "\n", encoding="utf-8")
 
 
+def python_bin() -> str:
+    for candidate in ("/usr/bin/python3", sys.executable):
+        if candidate and Path(candidate).exists():
+            return candidate
+    return "python3"
+
+
+def spawn_detached(worker_args: list[str]) -> None:
+    """Start a background worker that does not inherit our stdout/stderr.
+
+    The bar drives ctl.py through Quickshell's Process, which waits until every
+    writer on the stdout pipe exits. A plain os.fork() left the child attached
+    to that pipe, so scan/update appeared to do nothing: the launcher never
+    finished and later button clicks were ignored while ctlProcess.running.
+    """
+    subprocess.Popen(
+        [python_bin(), str(Path(__file__).resolve()), *worker_args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 def expand_target(raw: str) -> Path:
     path = Path(os.path.expanduser(raw)).resolve()
     if not path.exists():
@@ -416,21 +441,19 @@ def run_scan(target_raw: str, label: str) -> int:
     status["lastError"] = ""
     write_status(status)
 
-    # Detach into background so the QML Process call returns quickly with status.
-    if os.fork() != 0:
-        # Parent: wait briefly for child to write first progress, then print status.
-        time.sleep(0.15)
-        print(json.dumps(refresh_database_fields(read_status())))
-        return 0
+    spawn_detached(["_worker-scan", str(target), "--label", label or ""])
+    time.sleep(0.05)
+    print(json.dumps(refresh_database_fields(read_status())))
+    return 0
 
-    # Child worker
-    os.setsid()
+
+def worker_scan(target_raw: str, label: str) -> int:
     write_worker_pid()
     try:
-        _scan_worker(target, label)
+        _scan_worker(expand_target(target_raw), label)
     finally:
         clear_worker_pid()
-    os._exit(0)
+    return 0
 
 
 def _scan_worker(target: Path, label: str) -> None:
@@ -694,63 +717,66 @@ def run_update() -> int:
     status["lastError"] = ""
     write_status(status)
 
-    if os.fork() != 0:
-        time.sleep(0.1)
-        print(json.dumps(refresh_database_fields(read_status())))
-        return 0
+    spawn_detached(["_worker-update"])
+    time.sleep(0.05)
+    print(json.dumps(refresh_database_fields(read_status())))
+    return 0
 
-    os.setsid()
+
+def worker_update() -> int:
     write_worker_pid()
     helper = Path(__file__).resolve().parent / "update-helper.sh"
     try:
-        proc = subprocess.run(
-            ["pkexec", str(helper)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        ok = proc.returncode == 0
-        message = (proc.stdout or proc.stderr or "").strip()
-        if len(message) > 280:
-            message = message[-280:]
-    except OSError as exc:
-        ok = False
-        message = str(exc)
-
-    status = refresh_database_fields(read_status())
-    db = status["database"]
-    db["updating"] = False
-    db["lastUpdateOk"] = ok
-    db["lastUpdateAt"] = now_iso()
-    db["lastUpdateMessage"] = message or ("Updated" if ok else "Update failed")
-    if ok:
-        db["remindedAt"] = ""
-        status["phase"] = "idle"
-        status["lastError"] = ""
         try:
-            subprocess.run(
-                [
-                    "notify-send",
-                    "--app-name=ClamAV",
-                    "--urgency=low",
-                    "--icon=security-high",
-                    "ClamAV definitions updated",
-                    "Virus database refresh finished.",
-                ],
+            proc = subprocess.run(
+                ["pkexec", str(helper)],
                 check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
-        except OSError:
-            pass
-    else:
-        status["phase"] = "error"
-        status["lastError"] = message or "Database update failed"
-    status["database"] = db
-    status = refresh_database_fields(status)
-    write_status(status)
-    clear_worker_pid()
-    os._exit(0)
+            ok = proc.returncode == 0
+            message = (proc.stdout or proc.stderr or "").strip()
+            if len(message) > 280:
+                message = message[-280:]
+        except OSError as exc:
+            ok = False
+            message = str(exc)
+
+        status = refresh_database_fields(read_status())
+        db = status["database"]
+        db["updating"] = False
+        db["lastUpdateOk"] = ok
+        db["lastUpdateAt"] = now_iso()
+        db["lastUpdateMessage"] = message or ("Updated" if ok else "Update failed")
+        if ok:
+            db["remindedAt"] = ""
+            status["phase"] = "idle"
+            status["lastError"] = ""
+            try:
+                subprocess.run(
+                    [
+                        "notify-send",
+                        "--app-name=ClamAV",
+                        "--urgency=low",
+                        "--icon=security-high",
+                        "ClamAV definitions updated",
+                        "Virus database refresh finished.",
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+        else:
+            status["phase"] = "error"
+            status["lastError"] = message or "Database update failed"
+        status["database"] = db
+        status = refresh_database_fields(status)
+        write_status(status)
+    finally:
+        clear_worker_pid()
+    return 0
 
 
 def run_install() -> int:
@@ -775,72 +801,75 @@ def run_install() -> int:
     status["lastError"] = ""
     write_status(status)
 
-    if os.fork() != 0:
-        time.sleep(0.1)
-        print(json.dumps(refresh_database_fields(read_status())))
-        return 0
+    spawn_detached(["_worker-install"])
+    time.sleep(0.05)
+    print(json.dumps(refresh_database_fields(read_status())))
+    return 0
 
-    os.setsid()
+
+def worker_install() -> int:
     write_worker_pid()
     helper = Path(__file__).resolve().parent / "install-helper.sh"
     try:
-        proc = subprocess.run(
-            ["pkexec", str(helper)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        ok = proc.returncode == 0
-        message = (proc.stdout or proc.stderr or "").strip()
-        if len(message) > 400:
-            message = message[-400:]
-    except OSError as exc:
-        ok = False
-        message = str(exc)
-
-    status = refresh_database_fields(read_status())
-    install = status["install"]
-    install["installing"] = False
-    install["lastInstallOk"] = ok
-    install["lastInstallAt"] = now_iso()
-    install["lastInstallMessage"] = message or (
-        "ClamAV installed and configured" if ok else "Install failed"
-    )
-    status["install"] = install
-    status = refresh_database_fields(status)
-
-    if ok and status["install"].get("ready"):
-        status["phase"] = "idle"
-        status["lastError"] = ""
         try:
-            subprocess.run(
-                [
-                    "notify-send",
-                    "--app-name=ClamAV",
-                    "--urgency=low",
-                    "--icon=security-high",
-                    "ClamAV is ready",
-                    "Package installed, definitions downloaded, services enabled.",
-                ],
+            proc = subprocess.run(
+                ["pkexec", str(helper)],
                 check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
-        except OSError:
-            pass
-    elif ok:
-        status["phase"] = "error"
-        status["lastError"] = (
-            "Install finished but ClamAV is not fully ready yet. "
-            + (install.get("lastInstallMessage") or "Check services and try Configure again.")
-        )
-    else:
-        status["phase"] = "error"
-        status["lastError"] = message or "ClamAV install failed"
+            ok = proc.returncode == 0
+            message = (proc.stdout or proc.stderr or "").strip()
+            if len(message) > 400:
+                message = message[-400:]
+        except OSError as exc:
+            ok = False
+            message = str(exc)
 
-    write_status(status)
-    clear_worker_pid()
-    os._exit(0)
+        status = refresh_database_fields(read_status())
+        install = status["install"]
+        install["installing"] = False
+        install["lastInstallOk"] = ok
+        install["lastInstallAt"] = now_iso()
+        install["lastInstallMessage"] = message or (
+            "ClamAV installed and configured" if ok else "Install failed"
+        )
+        status["install"] = install
+        status = refresh_database_fields(status)
+
+        if ok and status["install"].get("ready"):
+            status["phase"] = "idle"
+            status["lastError"] = ""
+            try:
+                subprocess.run(
+                    [
+                        "notify-send",
+                        "--app-name=ClamAV",
+                        "--urgency=low",
+                        "--icon=security-high",
+                        "ClamAV is ready",
+                        "Package installed, definitions downloaded, services enabled.",
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+        elif ok:
+            status["phase"] = "error"
+            status["lastError"] = (
+                "Install finished but ClamAV is not fully ready yet. "
+                + (install.get("lastInstallMessage") or "Check services and try Configure again.")
+            )
+        else:
+            status["phase"] = "error"
+            status["lastError"] = message or "ClamAV install failed"
+
+        write_status(status)
+    finally:
+        clear_worker_pid()
+    return 0
 
 
 def cmd_status(notify: bool) -> int:
@@ -899,6 +928,12 @@ def main() -> int:
     sub.add_parser("install", help="Install and configure ClamAV via pkexec")
     sub.add_parser("ack-reminder", help="Mark the current reminder as acknowledged")
 
+    p_wscan = sub.add_parser("_worker-scan", help=argparse.SUPPRESS)
+    p_wscan.add_argument("target")
+    p_wscan.add_argument("--label", default="")
+    sub.add_parser("_worker-update", help=argparse.SUPPRESS)
+    sub.add_parser("_worker-install", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
     try:
         if args.command == "status":
@@ -913,6 +948,12 @@ def main() -> int:
             return run_install()
         if args.command == "ack-reminder":
             return cmd_ack_reminder()
+        if args.command == "_worker-scan":
+            return worker_scan(args.target, args.label)
+        if args.command == "_worker-update":
+            return worker_update()
+        if args.command == "_worker-install":
+            return worker_install()
     except FileNotFoundError as exc:
         status = refresh_database_fields(read_status())
         status["phase"] = "error"
