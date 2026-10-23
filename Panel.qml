@@ -21,18 +21,21 @@ Panel {
   readonly property string label: Model.compactLabel(status)
   readonly property bool scanning: svc.scanning
   readonly property bool updating: svc.updating
+  readonly property bool installing: svc.installing
+  readonly property bool needsSetup: svc.needsSetup
   readonly property bool alarming: svc.alarming
   readonly property int glyphBox: Math.max(Style.bar.iconCanvas, Style.bar.iconFont + Style.space(2))
   readonly property real progress: {
-    if (updating) return -1
+    if (updating || installing) return -1
     return Model.clamp(Model.numberValue(status.scan && status.scan.percent) / 100, 0, 1)
   }
 
   function refresh() { svc.refresh(false) }
-  function scanDownloads() { svc.startScan("downloads") }
-  function scanHome() { svc.startScan("home") }
+  function scanDownloads() { if (!root.needsSetup) svc.startScan("downloads") }
+  function scanHome() { if (!root.needsSetup) svc.startScan("home") }
   function stopWork() { svc.stop() }
-  function updateDb() { svc.updateDatabase() }
+  function updateDb() { if (!root.needsSetup) svc.updateDatabase() }
+  function installOrConfigure() { svc.installOrConfigure() }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -57,7 +60,9 @@ Panel {
     function refresh(): string { root.refresh(); return "ok" }
     function scan(): string { root.scanDownloads(); return "ok" }
     function update(): string { root.updateDb(); return "ok" }
+    function install(): string { root.installOrConfigure(); return "ok" }
     function status(): string {
+      if (root.needsSetup) return Model.phaseLabel(root.status)
       return Model.phaseLabel(root.status) + " · " + Model.ageText(root.status)
     }
   }
@@ -69,6 +74,10 @@ Panel {
     labelVisible: false
     hasVisualContent: true
     tooltipText: {
+      if (root.installing)
+        return "ClamAV installing and configuring…"
+      if (root.needsSetup)
+        return "ClamAV needs setup · click to install and configure"
       if (root.scanning)
         return "ClamAV scanning · " + Model.scanProgressText(root.status)
       if (root.updating)
@@ -82,12 +91,13 @@ Panel {
     horizontalMargin: 5
     fixedWidth: root.vertical ? -1 : Math.ceil(chip.implicitWidth + button.scaledHorizontalMargin * 2)
     fixedHeight: root.vertical ? Math.ceil(chip.implicitHeight + Style.space(8)) : -1
-    active: root.alarming || root.scanning || root.updating
+    active: root.alarming || root.scanning || root.updating || root.installing
 
     onPressed: function(pressedButton) {
       if (pressedButton === Qt.MiddleButton) root.refresh()
       else if (pressedButton === Qt.RightButton) {
-        if (root.scanning || root.updating) root.stopWork()
+        if (root.scanning || root.updating || root.installing) root.stopWork()
+        else if (root.needsSetup) root.installOrConfigure()
         else root.scanDownloads()
       } else {
         root.toggle()
@@ -114,7 +124,7 @@ Panel {
           to: 360
           duration: 1400
           loops: Animation.Infinite
-          running: root.scanning || root.updating
+          running: root.scanning || root.updating || root.installing
         }
       }
 
@@ -145,13 +155,15 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onActivateRequested: {
-        if (root.scanning || root.updating) root.stopWork()
+        if (root.scanning || root.updating || root.installing) root.stopWork()
+        else if (root.needsSetup) root.installOrConfigure()
         else root.scanDownloads()
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "i" || t === "I") root.installOrConfigure()
         else if (t === "d" || t === "D") root.scanDownloads()
         else if (t === "h" || t === "H") root.scanHome()
         else if (t === "u" || t === "U") root.updateDb()
@@ -183,6 +195,96 @@ Panel {
           }
 
           Column {
+            visible: root.needsSetup || root.installing
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "SETUP"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: Model.setupHint(root.status)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+
+              InfoPair {
+                label: "Package"
+                value: root.status.install && root.status.install.packageInstalled ? "installed" : "missing"
+              }
+              InfoPair {
+                label: "Definitions"
+                value: root.status.install && root.status.install.databasePresent ? "present" : "missing"
+              }
+              InfoPair {
+                label: "Services"
+                value: {
+                  var d = root.status.daemon || {}
+                  if (d.active && d.freshclamActive) return "running"
+                  if (d.enabled || d.freshclamEnabled) return "enabled"
+                  return "not configured"
+                }
+              }
+            }
+
+            Meter {
+              width: parent.width
+              value: -1
+              indeterminate: root.installing
+              alarming: false
+            }
+
+            Button {
+              width: parent.width
+              text: Model.setupButtonLabel(root.status)
+              iconText: "󰏖"
+              iconSpinning: root.installing
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              active: true
+              enabled: !root.installing && !root.scanning && !root.updating
+              onClicked: root.installOrConfigure()
+            }
+
+            Button {
+              width: parent.width
+              visible: root.installing
+              text: "Cancel"
+              iconText: "󰓛"
+              foreground: root.urgent
+              accent: root.urgent
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.stopWork()
+            }
+
+            Text {
+              visible: String(root.status.install && root.status.install.lastInstallMessage || "") !== ""
+              width: parent.width
+              text: String(root.status.install.lastInstallMessage)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              maximumLineCount: 4
+              elide: Text.ElideRight
+            }
+          }
+
+          Column {
+            visible: !root.needsSetup && !root.installing
             width: parent.width
             spacing: Style.space(8)
 
@@ -230,7 +332,7 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
-                enabled: !root.scanning && !root.updating
+                enabled: !root.scanning && !root.updating && !root.installing
                 onClicked: root.scanDownloads()
               }
 
@@ -241,7 +343,7 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
-                enabled: !root.scanning && !root.updating
+                enabled: !root.scanning && !root.updating && !root.installing
                 onClicked: root.scanHome()
               }
             }
@@ -259,9 +361,14 @@ Panel {
             }
           }
 
-          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSeparator {
+            visible: !root.needsSetup && !root.installing
+            width: parent.width
+            foreground: root.foreground
+          }
 
           Column {
+            visible: !root.needsSetup && !root.installing
             width: parent.width
             spacing: Style.space(8)
 
@@ -344,9 +451,14 @@ Panel {
             }
           }
 
-          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSeparator {
+            visible: !root.needsSetup && !root.installing
+            width: parent.width
+            foreground: root.foreground
+          }
 
           Column {
+            visible: !root.needsSetup && !root.installing
             width: parent.width
             spacing: Style.space(6)
 
@@ -375,7 +487,7 @@ Panel {
 
           Column {
             id: infectedSection
-            visible: root.status.scan && root.status.scan.infectedFiles
+            visible: !root.needsSetup && root.status.scan && root.status.scan.infectedFiles
               && root.status.scan.infectedFiles.length > 0
             width: parent.width
             spacing: Style.space(6)
@@ -416,7 +528,9 @@ Panel {
           Text {
             width: parent.width
             topPadding: Style.space(4)
-            text: "d downloads · h home · u update · x stop · r refresh"
+            text: root.needsSetup || root.installing
+              ? "i install · x cancel · r refresh"
+              : "d downloads · h home · u update · x stop · r refresh"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

@@ -84,7 +84,24 @@ def empty_status() -> dict:
             "lastUpdateMessage": "",
             "remindedAt": "",
         },
-        "daemon": {"active": False, "freshclamActive": False},
+        "daemon": {
+            "active": False,
+            "freshclamActive": False,
+            "enabled": False,
+            "freshclamEnabled": False,
+        },
+        "install": {
+            "packageInstalled": False,
+            "binariesPresent": False,
+            "databasePresent": False,
+            "ready": False,
+            "needsInstall": True,
+            "needsConfigure": False,
+            "installing": False,
+            "lastInstallOk": None,
+            "lastInstallAt": "",
+            "lastInstallMessage": "",
+        },
         "lastError": "",
     }
 
@@ -110,6 +127,9 @@ def read_status() -> dict:
     daemon = base["daemon"]
     daemon.update(data.get("daemon") or {})
     base["daemon"] = daemon
+    install = base["install"]
+    install.update(data.get("install") or {})
+    base["install"] = install
     return base
 
 
@@ -137,6 +157,38 @@ def unit_active(unit: str) -> bool:
         return False
 
 
+def unit_enabled(unit: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-enabled", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.returncode == 0
+    except OSError:
+        return False
+
+
+def package_installed() -> bool:
+    try:
+        proc = subprocess.run(
+            ["pacman", "-Q", "clamav"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode == 0:
+            return True
+    except OSError:
+        pass
+    return Path("/usr/bin/clamscan").exists() and Path("/usr/bin/freshclam").exists()
+
+
+def binaries_present() -> bool:
+    return Path("/usr/bin/clamscan").exists() and Path("/usr/bin/freshclam").exists()
+
+
 def db_mtime() -> float | None:
     root = Path("/var/lib/clamav")
     newest = None
@@ -151,10 +203,60 @@ def db_mtime() -> float | None:
     return newest
 
 
-def refresh_database_fields(status: dict, notify: bool = False) -> dict:
-    db = status["database"]
+def refresh_install_fields(status: dict) -> dict:
+    install = status.setdefault("install", empty_status()["install"])
+    pkg = package_installed()
+    bins = binaries_present()
     mtime = db_mtime()
-    if mtime is None:
+    db_present = mtime is not None
+    daemon_active = unit_active("clamav-daemon.service") or unit_active("clamav-daemon.socket")
+    freshclam_active = unit_active("clamav-freshclam.service")
+    daemon_enabled = unit_enabled("clamav-daemon.service") or unit_enabled("clamav-daemon.socket")
+    freshclam_enabled = unit_enabled("clamav-freshclam.service")
+
+    ready = bool(pkg and bins and db_present and daemon_active and freshclam_active)
+    needs_install = not (pkg and bins)
+    needs_configure = (pkg and bins) and not ready
+
+    # Preserve in-flight install flags/messages from the worker.
+    installing = bool(install.get("installing"))
+    install.update(
+        {
+            "packageInstalled": pkg,
+            "binariesPresent": bins,
+            "databasePresent": db_present,
+            "ready": ready,
+            "needsInstall": needs_install,
+            "needsConfigure": needs_configure,
+            "installing": installing,
+            "lastInstallOk": install.get("lastInstallOk"),
+            "lastInstallAt": install.get("lastInstallAt") or "",
+            "lastInstallMessage": install.get("lastInstallMessage") or "",
+        }
+    )
+    status["install"] = install
+    status["daemon"] = {
+        "active": daemon_active,
+        "freshclamActive": freshclam_active,
+        "enabled": daemon_enabled,
+        "freshclamEnabled": freshclam_enabled,
+    }
+    return status
+
+
+def refresh_database_fields(status: dict, notify: bool = False) -> dict:
+    status = refresh_install_fields(status)
+    db = status["database"]
+    install = status["install"]
+    mtime = db_mtime()
+
+    if not install.get("packageInstalled"):
+        db["ageHours"] = None
+        db["ageDays"] = None
+        db["lastUpdatedAt"] = ""
+        db["stale"] = False
+        db["reminderDue"] = False
+    elif mtime is None:
         db["ageHours"] = None
         db["ageDays"] = None
         db["lastUpdatedAt"] = ""
@@ -170,12 +272,7 @@ def refresh_database_fields(status: dict, notify: bool = False) -> dict:
         db["stale"] = age_days >= STALE_DAYS
         db["reminderDue"] = age_days >= REMINDER_DAYS
 
-    status["daemon"] = {
-        "active": unit_active("clamav-daemon.service"),
-        "freshclamActive": unit_active("clamav-freshclam.service"),
-    }
-
-    if notify and db.get("reminderDue") and not db.get("remindedAt"):
+    if notify and db.get("reminderDue") and not db.get("remindedAt") and install.get("ready"):
         send_reminder(db)
         db["remindedAt"] = now_iso()
     elif not db.get("reminderDue"):
@@ -296,8 +393,14 @@ def run_scan(target_raw: str, label: str) -> int:
         print(json.dumps(status))
         return 1
 
-    target = expand_target(target_raw)
     status = refresh_database_fields(read_status())
+    if not status["install"].get("ready"):
+        status["lastError"] = "ClamAV is not installed or configured yet"
+        write_status(status)
+        print(json.dumps(status))
+        return 1
+
+    target = expand_target(target_raw)
     scan = empty_scan()
     scan.update(
         {
@@ -541,6 +644,7 @@ def stop_worker() -> int:
         status["phase"] = "idle"
         status["scan"]["running"] = False
         status["database"]["updating"] = False
+        status["install"]["installing"] = False
         write_status(status)
         print(json.dumps(status))
         return 0
@@ -563,6 +667,7 @@ def stop_worker() -> int:
     status["scan"]["finishedAt"] = now_iso()
     status["scan"]["summary"] = "Scan cancelled"
     status["database"]["updating"] = False
+    status["install"]["installing"] = False
     status["lastError"] = ""
     write_status(status)
     print(json.dumps(status))
@@ -578,6 +683,12 @@ def run_update() -> int:
         return 1
 
     status = refresh_database_fields(read_status())
+    if not status["install"].get("packageInstalled"):
+        status["lastError"] = "ClamAV is not installed — use Install & configure first"
+        write_status(status)
+        print(json.dumps(status))
+        return 1
+
     status["phase"] = "updating"
     status["database"]["updating"] = True
     status["lastError"] = ""
@@ -642,6 +753,96 @@ def run_update() -> int:
     os._exit(0)
 
 
+def run_install() -> int:
+    if worker_alive():
+        status = refresh_database_fields(read_status())
+        status["lastError"] = "A scan or update is already running"
+        write_status(status)
+        print(json.dumps(status))
+        return 1
+
+    status = refresh_database_fields(read_status())
+    if status["install"].get("ready"):
+        status["lastError"] = ""
+        status["install"]["lastInstallMessage"] = "ClamAV is already installed and configured"
+        status["install"]["lastInstallOk"] = True
+        write_status(status)
+        print(json.dumps(status))
+        return 0
+
+    status["phase"] = "installing"
+    status["install"]["installing"] = True
+    status["lastError"] = ""
+    write_status(status)
+
+    if os.fork() != 0:
+        time.sleep(0.1)
+        print(json.dumps(refresh_database_fields(read_status())))
+        return 0
+
+    os.setsid()
+    write_worker_pid()
+    helper = Path(__file__).resolve().parent / "install-helper.sh"
+    try:
+        proc = subprocess.run(
+            ["pkexec", str(helper)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        ok = proc.returncode == 0
+        message = (proc.stdout or proc.stderr or "").strip()
+        if len(message) > 400:
+            message = message[-400:]
+    except OSError as exc:
+        ok = False
+        message = str(exc)
+
+    status = refresh_database_fields(read_status())
+    install = status["install"]
+    install["installing"] = False
+    install["lastInstallOk"] = ok
+    install["lastInstallAt"] = now_iso()
+    install["lastInstallMessage"] = message or (
+        "ClamAV installed and configured" if ok else "Install failed"
+    )
+    status["install"] = install
+    status = refresh_database_fields(status)
+
+    if ok and status["install"].get("ready"):
+        status["phase"] = "idle"
+        status["lastError"] = ""
+        try:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "--app-name=ClamAV",
+                    "--urgency=low",
+                    "--icon=security-high",
+                    "ClamAV is ready",
+                    "Package installed, definitions downloaded, services enabled.",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+    elif ok:
+        status["phase"] = "error"
+        status["lastError"] = (
+            "Install finished but ClamAV is not fully ready yet. "
+            + (install.get("lastInstallMessage") or "Check services and try Configure again.")
+        )
+    else:
+        status["phase"] = "error"
+        status["lastError"] = message or "ClamAV install failed"
+
+    write_status(status)
+    clear_worker_pid()
+    os._exit(0)
+
+
 def cmd_status(notify: bool) -> int:
     status = refresh_database_fields(read_status(), notify=notify)
     if status["scan"].get("running") and not worker_alive():
@@ -654,6 +855,21 @@ def cmd_status(notify: bool) -> int:
         if status["phase"] == "updating":
             status["phase"] = "error"
             status["lastError"] = "Update worker exited unexpectedly"
+    if status["install"].get("installing") and not worker_alive():
+        status["install"]["installing"] = False
+        if status["phase"] == "installing":
+            status["phase"] = "error"
+            status["lastError"] = "Install worker exited unexpectedly"
+    # Keep the setup phase visible while ClamAV still needs attention.
+    if (
+        status["phase"] in ("idle", "error")
+        and not status["install"].get("ready")
+        and not status["install"].get("installing")
+        and not status["scan"].get("running")
+        and not status["database"].get("updating")
+    ):
+        if status["phase"] != "error" or not status.get("lastError"):
+            status["phase"] = "setup"
     write_status(status)
     print(json.dumps(status))
     return 0
@@ -680,6 +896,7 @@ def main() -> int:
 
     sub.add_parser("stop", help="Stop a running scan/update worker")
     sub.add_parser("update", help="Refresh virus definitions via pkexec")
+    sub.add_parser("install", help="Install and configure ClamAV via pkexec")
     sub.add_parser("ack-reminder", help="Mark the current reminder as acknowledged")
 
     args = parser.parse_args()
@@ -692,6 +909,8 @@ def main() -> int:
             return stop_worker()
         if args.command == "update":
             return run_update()
+        if args.command == "install":
+            return run_install()
         if args.command == "ack-reminder":
             return cmd_ack_reminder()
     except FileNotFoundError as exc:

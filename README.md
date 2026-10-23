@@ -7,6 +7,7 @@ go stale.
 ## Features
 
 - Shield chip in the Omarchy shell bar
+- If ClamAV is missing (or not configured), the panel offers **Install & configure**
 - Live scan progress (percent + current file)
 - Start **Downloads** or **Home** scans from the popup (right-click starts the default)
 - **Update database** via a polkit prompt (`pkexec`)
@@ -16,12 +17,10 @@ go stale.
 ## Requirements
 
 - Omarchy (Quickshell bar)
-- `clamav` package
-- Recommended: `clamav-daemon` and `clamav-freshclam` enabled
+- Arch/`pacman` (the install button uses `pkexec` + `pacman -S clamav`)
 
-```bash
-sudo systemctl enable --now clamav-daemon.service clamav-freshclam.service
-```
+You do **not** need ClamAV installed beforehand — the plugin can install the package,
+download definitions, and enable `clamav-daemon` + `clamav-freshclam` for you.
 
 ## Install
 
@@ -45,11 +44,18 @@ omarchy plugin add <git-url> --enable --yes
 | Action | How |
 |--------|-----|
 | Open panel | Left click the shield |
+| Install & configure | Panel button, `i`, or right-click when setup is needed (polkit) |
 | Scan Downloads | Panel button, `d`, or right-click (default) |
 | Scan Home | Panel button or `h` |
 | Update definitions | Panel button or `u` (polkit password) |
 | Stop | Panel button, `x`, or right-click while busy |
 | Refresh status | Middle click or `r` |
+
+### What “Install & configure” does
+
+1. `pacman -S --needed clamav`
+2. `freshclam` (initial virus database)
+3. `systemctl enable --now clamav-freshclam` and `clamav-daemon`
 
 ## Reminder policy
 
@@ -69,7 +75,8 @@ manifest.json      Plugin contract
 Panel.qml          Bar chip + popup
 Service.qml        Status polling / actions
 Model.js           Labels and formatting
-ctl.py             Scan/update worker + status JSON
+ctl.py             Scan/update/install worker + status JSON
+install-helper.sh  Privileged package install + service setup (pkexec)
 update-helper.sh   Privileged freshclam refresh (pkexec)
 ```
 

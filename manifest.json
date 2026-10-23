@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "glink.clamav",
   "name": "ClamAV",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "glink",
   "license": "MIT",
-  "description": "Scan files with ClamAV from the bar, watch live progress, and get reminded when virus definitions are stale.",
+  "description": "Scan files with ClamAV from the bar, watch live progress, install and configure ClamAV if missing, and get reminded when virus definitions are stale.",
   "kinds": [
     "bar-widget"
   ],

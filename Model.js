@@ -34,7 +34,24 @@ function emptyStatus() {
       lastUpdateMessage: "",
       remindedAt: ""
     },
-    daemon: { active: false, freshclamActive: false },
+    daemon: {
+      active: false,
+      freshclamActive: false,
+      enabled: false,
+      freshclamEnabled: false
+    },
+    install: {
+      packageInstalled: false,
+      binariesPresent: false,
+      databasePresent: false,
+      ready: false,
+      needsInstall: true,
+      needsConfigure: false,
+      installing: false,
+      lastInstallOk: null,
+      lastInstallAt: "",
+      lastInstallMessage: ""
+    },
     lastError: ""
   }
 }
@@ -58,8 +75,37 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
 }
 
+function installReady(status) {
+  return !!(status && status.install && status.install.ready)
+}
+
+function needsSetup(status) {
+  if (!status || !status.install) return true
+  return !status.install.ready
+}
+
+function setupButtonLabel(status) {
+  if (status && status.install && status.install.installing) return "Installing…"
+  if (status && status.install && status.install.needsConfigure) return "Configure ClamAV"
+  return "Install & configure"
+}
+
+function setupHint(status) {
+  if (status && status.install && status.install.installing)
+    return "Installing the package, downloading definitions, and enabling services. Approve the polkit prompt if asked."
+  if (status && status.install && status.install.needsConfigure)
+    return "ClamAV is installed but not fully set up. This enables the scanner daemon, starts the definition updater, and downloads the virus database."
+  return "ClamAV is not installed. This installs the Arch package, downloads virus definitions, and enables clamav-daemon + clamav-freshclam."
+}
+
 function phaseLabel(status) {
   var phase = String(status && status.phase || "idle")
+  if (phase === "installing" || (status && status.install && status.install.installing))
+    return "Installing ClamAV"
+  if (phase === "setup" || needsSetup(status)) {
+    if (status && status.install && status.install.needsConfigure) return "Needs configuration"
+    return "Not installed"
+  }
   if (phase === "scanning") return "Scanning"
   if (phase === "updating") return "Updating definitions"
   if (phase === "infected") return "Threats found"
@@ -75,10 +121,14 @@ function compactLabel(status) {
     var pct = Math.round(numberValue(status.scan && status.scan.percent))
     return pct > 0 ? (pct + "%") : "…"
   }
+  if (status.phase === "installing" || (status.install && status.install.installing))
+    return "…"
   if (status.phase === "updating" || (status.database && status.database.updating))
     return "upd"
   if (status.phase === "infected")
     return String(Math.round(numberValue(status.scan && status.scan.infected)))
+  if (needsSetup(status))
+    return "setup"
   if (status.database && status.database.reminderDue)
     return "!"
   return ""

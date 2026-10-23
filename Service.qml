@@ -25,14 +25,16 @@ Item {
     return homeDir + "/Downloads"
   }
   readonly property int pollMs: {
-    if (scanning || updating) return 400
+    if (scanning || updating || installing) return 400
     return intSetting("pollIntervalSec", 30, 5, 300) * 1000
   }
   readonly property string defaultTarget: String(setting("defaultTarget", "downloads"))
   readonly property bool scanning: !!(status && status.scan && status.scan.running) || status.phase === "scanning"
   readonly property bool updating: !!(status && status.database && status.database.updating) || status.phase === "updating"
+  readonly property bool installing: !!(status && status.install && status.install.installing) || status.phase === "installing"
+  readonly property bool needsSetup: Model.needsSetup(status)
   readonly property bool reminderDue: !!(status && status.database && status.database.reminderDue)
-  readonly property bool alarming: reminderDue || status.phase === "infected" || status.phase === "error"
+  readonly property bool alarming: needsSetup || reminderDue || status.phase === "infected" || status.phase === "error"
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -86,6 +88,14 @@ Item {
     busy = true
     lastError = ""
     ctlProcess.command = ["python3", ctlPath, "update"]
+    ctlProcess.running = true
+  }
+
+  function installOrConfigure() {
+    if (ctlProcess.running) return
+    busy = true
+    lastError = ""
+    ctlProcess.command = ["python3", ctlPath, "install"]
     ctlProcess.running = true
   }
 
