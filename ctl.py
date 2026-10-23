@@ -296,12 +296,25 @@ def refresh_database_fields(status: dict, notify: bool = False) -> dict:
         db["stale"] = age_days >= STALE_DAYS
         db["reminderDue"] = age_days >= REMINDER_DAYS
 
-    if notify and db.get("reminderDue") and not db.get("remindedAt") and install.get("ready"):
-        send_reminder(db)
-        db["remindedAt"] = now_iso()
-    elif not db.get("reminderDue"):
+    # Never send notifications while a caller may hold status_lock — notify-send
+    # can block on D-Bus and would stall every other ctl.py invocation.
+    if not db.get("reminderDue"):
         db["remindedAt"] = ""
+    elif notify and not db.get("remindedAt") and install.get("ready"):
+        db["_pendingReminder"] = True
 
+    return status
+
+
+def emit_pending_reminder(status: dict) -> dict:
+    db = status.get("database") or {}
+    if not db.pop("_pendingReminder", False):
+        return status
+    if db.get("remindedAt"):
+        return status
+    send_reminder(db)
+    db["remindedAt"] = now_iso()
+    status["database"] = db
     return status
 
 
@@ -470,7 +483,12 @@ def run_scan(target_raw: str, label: str) -> int:
         status["scan"] = scan
         status["lastError"] = ""
         _write_status_unlocked(status)
-        spawn_detached(["_worker-scan", str(target), "--label", label or ""])
+        target_s = str(target)
+        label_s = label or ""
+
+    # Spawn outside the lock so the worker can write progress immediately.
+    spawn_detached(["_worker-scan", target_s, "--label", label_s])
+    with status_lock():
         print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
@@ -746,7 +764,9 @@ def run_update() -> int:
         status["database"]["updating"] = True
         status["lastError"] = ""
         _write_status_unlocked(status)
-        spawn_detached(["_worker-update"])
+
+    spawn_detached(["_worker-update"])
+    with status_lock():
         print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
@@ -829,7 +849,9 @@ def run_install() -> int:
         status["install"]["installing"] = True
         status["lastError"] = ""
         _write_status_unlocked(status)
-        spawn_detached(["_worker-install"])
+
+    spawn_detached(["_worker-install"])
+    with status_lock():
         print(json.dumps(refresh_database_fields(read_status())))
     return 0
 
@@ -943,8 +965,25 @@ def cmd_status(notify: bool) -> int:
         ):
             if status["phase"] != "error" or not status.get("lastError"):
                 status["phase"] = "setup"
+        pending = bool((status.get("database") or {}).get("_pendingReminder"))
+        if pending:
+            status["database"].pop("_pendingReminder", None)
         _write_status_unlocked(status)
-        print(json.dumps(status))
+        payload = json.dumps(status)
+
+    if pending:
+        # Notify outside the lock, then persist remindedAt.
+        scratch = json.loads(payload)
+        scratch["database"]["_pendingReminder"] = True
+        scratch = emit_pending_reminder(scratch)
+        with status_lock():
+            current = read_status()
+            if current.get("database", {}).get("reminderDue") and not current.get("database", {}).get("remindedAt"):
+                current["database"]["remindedAt"] = scratch["database"].get("remindedAt") or now_iso()
+                _write_status_unlocked(current)
+                payload = json.dumps(refresh_database_fields(current))
+
+    print(payload)
     return 0
 
 
