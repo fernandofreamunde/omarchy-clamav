@@ -24,7 +24,11 @@ download definitions, and enable `clamav-daemon` + `clamav-freshclam` for you.
 
 ## Install
 
-From this repo (development symlink):
+```bash
+omarchy plugin add https://github.com/fernandofreamunde/omarchy-clamav.git --enable
+```
+
+Development symlink (optional):
 
 ```bash
 mkdir -p ~/.config/omarchy/plugins
@@ -33,11 +37,23 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable glink.clamav --section right
 ```
 
-Or add from git once published:
+## Remove
 
 ```bash
-omarchy plugin add <git-url> --enable --yes
+omarchy plugin remove glink.clamav
 ```
+
+That disables the widget and deletes the plugin checkout. It does **not** uninstall the system `clamav` package or stop its services — remove those separately if you want them gone:
+
+```bash
+sudo systemctl disable --now clamav-daemon.service clamav-freshclam.service
+sudo pacman -Rns clamav
+```
+
+## Dependencies
+
+- **Omarchy** shell (Quickshell bar)
+- **clamav** (optional at plugin install time — the in-panel setup button can install and configure it via `pkexec` + `pacman`)
 
 ## Usage
 
